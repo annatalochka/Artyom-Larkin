@@ -1,0 +1,698 @@
+#include <avr/wdt.h>
+#include <Wire.h>
+#include "LCD_1602_RUS.h"
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Bounce2.h>
+#include <EEPROM.h>
+#include <Password.h>
+#include <Keypad.h>
+LCD_1602_RUS lcd(0x27, 16, 2); // инициализация дисплея, 16 столбцов, 2
+строки
+//Определение основных пинов, к которым подключаются различные модули:
+#define PIN_RESET 14 // кнопка для сброса EEPROM
+#define PIN_RELAY 6 // подключение реле
+#define PIN_TONE 15 // пьезодинамик
+46
+#define PIN_RST 9 // RFID RST
+#define PIN_SS 10 // RFID SS
+#define RED_LED 17 // красный светодиод
+#define GREEN_LED 16 //зеленый светодиод
+//Инициализация RFID-считывателя:
+MFRC522 mfrc522(PIN_SS, PIN_RST);
+//Переменные, необходимые для работы со списком RFID-ключей:
+byte **keyss;
+byte keys_count = EEPROM.read(0);
+//Переменные необходимые для режима программирования RFID-меток:
+byte modeProgTime = 5; // Количество секунд удержания мастер ключа для
+входа или выхода из режима программирования
+bool mode = false;
+byte modeClean = 0;
+unsigned long modeTimer = 0;
+unsigned long resetTimer = 0;
+//Управление замком:
+unsigned long openTimer = 0;
+//Защита кнопок от дребезга:
+Bounce key_reset = Bounce();
+Bounce key_open = Bounce();
+//Программный reset:
+void(* resetFunc) (void) = 0;
+//Функция звукового оповещения. Принимает параметры: количество
+//звуковых сигналов, частота в герцах, продолжительность звука, пауза в
+//милисекундах (не обязательно):
+void squeaker(byte count, unsigned int Hz, unsigned int duration, unsigned int
+sleep = 0)
+{
+for(int i=0; i<count; i++) {
+tone(PIN_TONE, Hz, duration);
+47
+if(sleep > 0) delay(sleep);
+}
+}
+//Функция для считывания EEPROM и составления списка RFID-ключей.
+//Первый байт в памяти содержит количество ключей. UID ключа содержит 4
+//байта. Максимум можно записать 254 ключа (255-1 из-за того, что в
+//EEPROM записывается кодовая комбинация из 4 символов):
+void keysRead() {
+//Выводим количество ключей:
+Serial.print(F("KEYS COUNT: "));
+Serial.println(keys_count);
+int eb = 4; // Запись количества доступных ключей производится в
+keyss = (byte**)malloc(sizeof(byte*)*keys_count);
+// Читаем список ключей из EEPROM:
+Serial.println(F("------------------------------"));
+for(byte i=0; i<keys_count; i++) {
+Serial.print(F("KEY: "));Serial.print(i);Serial.print(" | ");
+keyss[i] = (byte*)malloc(sizeof(byte)*4);
+for(byte b=0; b<4; b++) {
+keyss[i][b] = EEPROM.read(++eb);
+Serial.print(keyss[i][b]);
+if(b < 3) Serial.print(F(" "));
+}
+Serial.println();
+}
+Serial.println(F("------------------------------"));
+Serial.println();
+}
+//Функция вывода пароля, записанного с 1 по 5 ячейку памяти, т.к
+//переменные записываются в типе char, то нужно перевести код ASCII в
+//десятичный. Для цифр от 0 до 9 это можно сделать просто вычитанием из
+//полученного результата числа 48:
+void passRead() {
+Serial.print(F("PASSWORD: "));
+Serial.print(EEPROM.read(1)-48);
+Serial.print(EEPROM.read(2)-48);
+48
+Serial.print(EEPROM.read(3)-48);
+Serial.print(EEPROM.read(4)-48);
+Serial.println();
+Serial.println(F("------------------------------"));
+Serial.println(); }
+//Функция выводит UID ключа и, при необходимости, сопроводительное
+//сообщение:
+void uidPrint(String text = "") {
+Serial.print(F("UID: "));
+for(byte i=0; i<mfrc522.uid.size; i++) {
+Serial.print(mfrc522.uid.uidByte[i]);
+if(i < mfrc522.uid.size - 1) Serial.print(F(" ")); }
+Serial.println();
+if(text.length() != 0) Serial.println(text + "\r\n");
+}
+int presses=0; // количество нажатий
+const byte ROWS = 4; // количество строк
+const byte COLS = 4; // количество столбцов
+// Определение символов матричной клавиатуры:
+char keys[ROWS][COLS] =
+{
+{'1','2','3','A'},
+{'4','5','6','B'},
+{'7','8','9','C'},
+{'*','0','#','D'}
+};
+//Цифровые входы, к которым подключается матричная клавиатура:
+byte rowPins[ROWS] = {2,3,4,18};
+byte colPins[COLS] = {5,7,8,19};
+//Инициализация матричной клавиатуры:
+Keypad keypad = Keypad( makeKeymap(keys), rowPins, colPins, ROWS, COLS
+);
+String pass; //переменная, указывающая код по умолчанию
+String summ; //переменная, указывающая уже введенный код
+49
+int wrong=0; //количество ошибочных вводов кода (для блокировки)
+int shetch=1; //количество набранных символов для смены пароля
+int change=0; //флаг проверки кода для смены пароля
+int dochange=0; //флаг производится смена пароля
+//Функция, запускающаяся только в начале работы микроконтроллера или
+//при аппаратном сбросе:
+void setup()
+{
+// Настраиваем сторожевой таймер
+wdt_disable();
+//delay(8000);
+wdt_enable(WDTO_8S);
+//Запись исходного пароля в энергонезависимую память, необходимо только
+//при первоначальной прошивке, чтобы задать пароль:
+//EEPROM.write(1, '1');
+//EEPROM.write(2, '2');
+//EEPROM.write(3, '0');
+//EEPROM.write(4, '4');
+//Запись символов в формате char:
+pass = "";
+pass = pass+char(EEPROM.read(1));
+pass = pass+char(EEPROM.read(2));
+pass = pass+char(EEPROM.read(3));
+pass = pass+char(EEPROM.read(4));
+//Эти строки только для отладки, выводится в COM-порт, к которому
+//подключен микроконтроллер:
+Serial.println(char(EEPROM.read(1))); // первый знак пароля в
+Serial.println(char(EEPROM.read(2))); // второй знак пароля
+Serial.println(char(EEPROM.read(3))); // третий знак пароля
+Serial.println(char(EEPROM.read(4))); // четвертый знак пароля
+Serial.print("Pass "); Serial.println(pass); //весь пароль
+//Инициализация используемых входов:
+50
+//Реле:
+pinMode(PIN_RELAY, OUTPUT);
+digitalWrite(PIN_RELAY, HIGH);
+//Кнопка для сброса памяти:
+pinMode(PIN_RESET,INPUT_PULLUP);
+key_reset.attach(PIN_RESET);
+key_reset.interval(5);
+//Инициализация консоли последовательного вывода данных на экран:
+Serial.begin(9600);
+while (!Serial);
+Serial.println(F("Start\r\n"));
+//Инициализация основных модулей:
+lcd.init();
+lcd.backlight();
+SPI.begin();
+mfrc522.PCD_Init();
+pinMode(RED_LED, OUTPUT);
+pinMode(GREEN_LED, OUTPUT);
+digitalWrite(RED_LED, HIGH);
+digitalWrite(GREEN_LED, LOW);
+lcd.setCursor(4,0);
+lcd.print(L"ОЖИДАНИЕ");
+lcd.setCursor(4,1);
+lcd.print(L"ДЕЙСТВИЯ");
+//Считываем количество ключей, значение должно быть =>1 т.к первый ключ
+//это мастер-ключ. В случае его потери, сбросить EEPROM и создать новый
+//мастер-ключ:
+if(keys_count > 0 and keys_count < 255) {
+keysRead();
+passRead();
+}
+else {
+51
+keys_count = 0; //Определение нового мастер-ключа
+Serial.println(F("The master key is not in memory. The first presentation to the
+key will be the master!\r\n"));
+digitalWrite(PIN_RELAY, LOW);
+lcd.clear();
+lcd.setCursor(4,0);
+lcd.print(L"УКАЖИТЕ");
+lcd.setCursor(2,1);
+lcd.print(L"МАСТЕР-КЛЮЧ");
+}
+}
+//Функция цикла программы:
+void loop()
+{
+// Сбрасываем сторожевой таймер микроконтроллера:
+wdt_reset();
+if(resetTimer > millis()+10000) resetTimer = 0;
+if(openTimer > millis()+10000) openTimer = 0;
+char key = keypad.getKey(); //задаем функцию для работы с кнопками
+клавиатуры
+if (key) // если нажата кнопка клавиатуры
+{
+Serial.println(key);
+squeaker(1, 2000, 100);
+presses=presses+1; //увеличиваем на единицу счет количества символов
+summ=summ+key;
+Serial.print("Pass "); Serial.println(summ);
+//Вывод на дисплей знаков «*» при нажатии на клавиатуру:
+if(presses == 1 or shetch == 1)
+{
+lcd.clear();
+lcd.setCursor(1,0);
+lcd.print(" < PIN >");
+lcd.setCursor(0,1);
+lcd.print("*_");
+}
+52
+if(presses == 2 or shetch == 2)
+{
+lcd.clear();
+lcd.setCursor(1,0);
+lcd.print(" < PIN >");
+lcd.setCursor(0,1);
+lcd.print("**_");
+}
+if(presses == 3 or shetch == 3)
+{
+lcd.clear();
+lcd.setCursor(1,0);
+lcd.print(" < PIN >");
+lcd.setCursor(0,1);
+lcd.print("***_");
+}
+if(presses == 4 or shetch == 4)
+{
+lcd.clear();
+lcd.setCursor(1,0);
+lcd.print(" < PIN >");
+lcd.setCursor(0,1);
+lcd.print("****");
+}
+switch (dochange) //ветвление на ввод нового пароля (case 1) и проверку (case
+0)
+{
+case 0: //блок для обычной работы - проверка правильности ввода пароля
+//В данном случае кнопки # и * приводят к сбросу количества нажатий:
+if (key=='#')
+{
+summ="";
+presses=0;
+Serial.println("# for RESET");
+squeaker(1, 500, 100);
+};
+53
+if (key=='*')
+{
+summ="";
+presses=0;
+Serial.println("* for ENTER");
+squeaker(1, 500, 100);
+};
+// Если правильный пароль и не было запроса на его смену:
+if (summ==pass && change==0) {
+Serial.println("PASS OK");
+summ="";
+presses=0;
+wrong=0;
+openTimer = millis()/1000;
+squeaker(2, 3500, 200, 100);
+digitalWrite(PIN_RELAY, LOW);
+allow();
+};
+//Если нажата комбинация для смены пароля:
+if (summ=="0000") {
+Serial.println("Change pass go test");
+summ="";
+presses=0;
+wrong=0;
+change=1;
+squeaker(3, 700, 150);
+lcd.clear();
+lcd.setCursor(2,0);
+lcd.print(L"СМЕНА ПАРОЛЯ");
+};
+//Если правильный пароль и был запрос на смену кода
+if (summ==pass && change==1){
+Serial.println("Pass ok go change pass");
+summ="";
+presses=0;
+wrong=0;
+54
+dochange=1;
+key = keypad.getKey();
+squeaker(4, 1000, 50);
+lcd.clear();
+lcd.setCursor(0,0);
+lcd.print(L"СМЕНА РАЗРЕШЕНА");
+};
+//При смене пароля - если введено полное количество знаков пароля, и он
+//ошибочный, формируется звуковой сигнал:
+if (wrong==0 && presses==4 && change==1) {
+summ="";
+presses=0;
+wrong=wrong+1;
+Serial.println("Wrong_Pass");
+squeaker(4, 500, 50);
+lcd.clear();
+lcd.setCursor(0,0);
+lcd.print(L"НЕВЕРНЫЙ ПАРОЛЬ");
+};
+//При смене пароля - если два раза ошибочный код, формируем звуковые
+//сигналы
+if (wrong==1 && presses==4 && change==1) {
+summ="";
+presses=0;
+wrong=wrong+1;
+Serial.println("Attention!_2xWrong_Pass for change pas");
+squeaker(4, 500, 50);
+lcd.clear();
+lcd.setCursor(0,0);
+lcd.print(L"НЕВЕРНЫЙ ПАРОЛЬ");
+lcd.setCursor(3,1);
+lcd.print(L"ВТОРОЙ РАЗ");
+};
+//При смене пароля - если три раза ошибочный код, выходим из режима
+//смены пароля:
+if (wrong==2 && presses==4 && change==1){ 
+55
+summ="";
+presses=0;
+wrong=0;
+change=0;
+Serial.println("Attention!_3xWrong_Pass for change pas - cancel change pass");
+squeaker(1, 500, 1000);
+denied();
+};
+//Если введено полное количество знаков пароля, но он ошибочный:
+if (presses==4 && change==0){
+summ="";
+presses=0;
+wrong=wrong+1;
+Serial.println("Wrong_Pass");
+squeaker(1, 500, 300);
+lcd.clear();
+lcd.setCursor(0,0);
+lcd.print(L"НЕВЕРНЫЙ ПАРОЛЬ");
+delay(1000);
+wait();
+};
+//Если два раза ошибочный пароль:
+if (wrong==2 && presses==0 && change==0) {
+Serial.println("Attention!_2xWrong_Pass");
+squeaker(1, 500, 500);
+lcd.clear();
+lcd.setCursor(0,0);
+lcd.print(L"НЕВЕРНЫЙ ПАРОЛЬ");
+lcd.setCursor(3,1);
+lcd.print(L"ВТОРОЙ РАЗ");
+delay(1000);
+wait();
+};
+//Если три раза ошибочный пароль:
+if (wrong==3 && presses==0 && change==0) {
+summ="";
+56
+presses=0;
+wrong=0;
+Serial.println("Attention!_3xWrong_Pass");
+squeaker(1, 500, 1000);
+denied();
+};
+break;
+//Вторая часть блока для смены пароля, начало блока для смены пароля и его
+//записи в энергонезависимую память:
+case 1:
+if (key=='#') //если введен символ # сбрасываем код
+{
+shetch=1;
+summ="";
+Serial.println("# is not an option, reset");
+squeaker(1, 500, 100);
+}
+else if (key=='*') //если введен символ * сбрасываем код
+{
+shetch=1;
+summ="";
+Serial.println("* is not an option, reset");
+squeaker(1, 500, 100);
+}
+else if (shetch==1 && (key)) //Меняем 1-ый символ пароля
+{
+Serial.print("NewPass_symbol_one "); Serial.println(key);
+squeaker(1, 2000, 100);
+shetch=2; //увеличиваем на единицу счет количества символов нового пароля
+EEPROM.write(1, key);
+Serial.println(char(EEPROM.read(1))); //проговариваем первый знак пароля в
+порт
+}
+else if (shetch==2 && (key)) // Меняем 2-ой символ пароля
+{
+Serial.print("NewPass_symbol_two "); Serial.println(key);
+57
+EEPROM.write(2, key);
+squeaker(1, 2000, 100);
+shetch=3; //увеличиваем на единицу счет количества символов нового пароля
+Serial.println(char(EEPROM.read(2))); //проговариваем второй знак пароля в
+порт
+}
+else if (shetch==3 && (key)) // Меняем 3-ий символ пароля
+{
+Serial.print("NewPass_symbol_three "); Serial.println(key);
+EEPROM.write(3, key);
+squeaker(1, 2000, 100);
+shetch=4; //увеличиваем на единицу счет количества символов нового пароля
+Serial.println(char(EEPROM.read(3))); //проговариваем третий знак пароля в
+порт
+}
+else if (shetch==4 && (key)) // Меняем 4-ый символ пароля
+{
+Serial.print("NewPass_symbol_four "); Serial.println(key);
+EEPROM.write(4, key);
+squeaker(1, 2000, 100);
+Serial.println(char(EEPROM.read(4))); // проговариваем четвертый знак
+пароля в порт
+String passnew = ""; // вводим переменную, содержащую новый введенный
+пароль
+passnew = passnew+char(EEPROM.read(1));
+passnew = passnew+char(EEPROM.read(2));
+passnew = passnew+char(EEPROM.read(3));
+passnew = passnew+char(EEPROM.read(4));
+passRead();
+if (passnew==pass) // если новый пароль равен старому
+{
+shetch=1; // запрашиваем другой новый пароль
+58
+summ="";
+Serial.println("NewPass equal old pass, Reset");
+squeaker(5, 600, 100);
+lcd.clear();
+lcd.setCursor(1,0);
+lcd.print(L"СТАРЫЙ ПАРОЛЬ");
+}
+else if (passnew=="0000") // если новый пароль равен комбинации для смены
+пароля
+{
+shetch=1; // запрашиваем другой новый пароль
+summ="";
+Serial.println("NewPass equal 0000, Reset");
+squeaker(5, 600, 100);
+lcd.clear();
+lcd.setCursor(1,0);
+lcd.print(L"СТАРЫЙ ПАРОЛЬ");
+}
+else {
+//Присваиваем паролю значения из энергонезависимой памяти:
+pass = "";
+pass = pass+char(EEPROM.read(1));
+pass = pass+char(EEPROM.read(2));
+pass = pass+char(EEPROM.read(3));
+pass = pass+char(EEPROM.read(4));
+//Вывод в порт пароля для отладки:
+Serial.println("Pass read test: ");
+Serial.println(char(EEPROM.read(1))); //проговариваем первый знак пароля в
+порт
+Serial.println(char(EEPROM.read(2))); //проговариваем второй знак пароля в
+порт
+Serial.println(char(EEPROM.read(3))); //проговариваем третй знак пароля в
+порт
+Serial.println(char(EEPROM.read(4))); //проговариваем четвертый знак пароля
+в порт
+Serial.print("Pass "); Serial.println(pass); //проговариваем пароль в порт
+59
+//Выходим из цикла "case 1":
+dochange=0;
+change=0;
+presses=0;
+shetch=1;
+summ="";
+squeaker(5, 900, 100);
+lcd.clear();
+lcd.setCursor(2,0);
+lcd.print(L"НОВЫЙ ПАРОЛЬ");
+digitalWrite(GREEN_LED, HIGH);
+digitalWrite(RED_LED, LOW);
+delay(3000);
+digitalWrite(GREEN_LED, LOW);
+digitalWrite(RED_LED, HIGH);
+wait();
+break;
+}
+};
+//конец блока для смены пароля и его записи в энергонезависимую память
+}
+}
+//Очистка памяти:
+key_reset.update();
+if(key_reset.read() == HIGH) {
+if(resetTimer == 0) resetTimer = millis();
+else {
+if((millis()-resetTimer)/1000 > 5) {
+Serial.println(F("Launched memory cleaning"));
+squeaker(4, 1600, 300, 200);
+wdt_disable();
+for(int i=5; i<=EEPROM.length(); i++) {
+EEPROM.write(i, 0);
+if(!(i%50)) Serial.println(F("#")); else Serial.print(F("#"));
+}
+Serial.println(F("\r\nMemory cleaning is completed\r\n"));
+delay(1000);
+resetFunc();
+60
+}
+}
+}
+else if(resetTimer != 0) resetTimer = 0;
+//Автоматическое закрытие двери через 5 секунд:
+if(openTimer != 0) {
+if(millis()/1000 - openTimer > 5) {
+openTimer = 0;
+digitalWrite(PIN_RELAY, HIGH);
+digitalWrite(GREEN_LED, LOW);
+digitalWrite(RED_LED, HIGH);
+wait();
+Serial.println("* closed lock\r\n");
+}
+}
+//Если ключ отсутствует или не читается, не выполняем дальнейший код:
+if(!mfrc522.PICC_IsNewCardPresent()) {
+//Очистка таймера входа в режим программирования, в случае если
+//считыватель свободен:
+if(modeTimer != 0) {
+if(++modeClean > 5) modeTimer = modeClean = 0;
+}
+return;
+}
+if(!mfrc522.PICC_ReadCardSerial()) return;
+//Останавливаем режим очистки:
+modeClean = 0;
+//Создание мастер-ключа:
+if(keys_count == 0) {
+for(byte i=0; i<4; i++) EEPROM.write(i+5, mfrc522.uid.uidByte[i]);
+EEPROM.write(0, keys_count = 1);
+uidPrint(F("master key is created"));
+digitalWrite(PIN_RELAY, HIGH);
+keysRead();
+61
+squeaker(8, 1200, 100, 100);
+delay(2000);
+return;
+}
+//Проверка ключа на соответствие:
+bool access = false;
+bool master = false;
+for(byte i=0; i<keys_count; i++) {
+for(byte b=0; b<4; b++) {
+if(keyss[i][b] != mfrc522.uid.uidByte[b]) break;
+if(b == 3) {
+access = true;
+if(i == 0) master = true;
+// Останавливаем проверку
+i = keys_count;
+}
+}
+}
+//Контроль доступа:
+if(access and !mode and !master) {
+// Доступ разрешен
+openTimer = millis()/1000;
+digitalWrite(PIN_RELAY, LOW);
+squeaker(2, 3500, 200, 200);
+allow();
+}
+else if(!access and !mode and !master) {
+// Доступ запрещен
+squeaker(1, 500, 1000);
+denied();
+}
+//Режим программирования - запись ключа:
+if(access and mode and !master) {
+62
+// Попытка записи существующего ключа
+uidPrint(F("error: key already exists in eeprom"));
+squeaker(2, 500, 300);
+lcd.clear();
+lcd.setCursor(1,0);
+lcd.print(L"КАРТА ИЗВЕСТНА");
+delay(2000);
+wait();
+}
+else if(!access and mode and !master) {
+// Записываем новый ключ
+// Максимум 255 ключей (с учетом первого байта)
+if(keys_count < 255) {
+for(byte i=0; i<4; i++) EEPROM.write(5 + keys_count*4 + i,
+mfrc522.uid.uidByte[i]);
+EEPROM.write(0, ++keys_count);
+uidPrint(F("add key in eeprom"));
+keysRead();
+lcd.clear();
+lcd.setCursor(4,0);
+lcd.print(L"ПРИЛОЖИТЕ");
+lcd.setCursor(2,0);
+lcd.print(L"НОВУЮ КАРТУ");
+squeaker(2, 2200, 200, 200);
+}
+else // нет памяти для записи
+{
+uidPrint(F("error: not enough memory for recording key!"));
+squeaker(2, 500, 300);
+}
+delay(2000);
+wait();
+}
+//Работа с мастер-ключом:
+else if(access and master) {
+// Мастер ключ в обычном режиме
+if(modeTimer == 0) {
+modeTimer = millis()/1000;
+63
+if(!mode) {
+openTimer = millis()/1000;
+digitalWrite(PIN_RELAY, LOW);
+// Сигнал о наличии мастер ключа в обычном режиме
+uidPrint(F("MASTER KEY"));
+squeaker(2, 3200, 200, 200);
+allow();
+}
+}
+else
+{
+if(millis()/1000 - modeTimer > modeProgTime and modeTimer != 0)
+{
+modeTimer = 0;
+if((mode = !mode) == true)
+{
+//Вход в режим программирования:
+digitalWrite(PIN_RELAY, LOW);
+uidPrint(F("MASTER PROGRAMMING MODE ON"));
+squeaker(4, 1200, 200, 200);
+}
+else {
+// Выход из режима программирования
+digitalWrite(PIN_RELAY, HIGH);
+uidPrint(F("MASTER PROGRAMMING MODE OFF"));
+squeaker(4, 2200, 200, 200);
+}
+}
+delay(5000);
+wait();
+}
+// Мастер ключ удерживается у считывателя на 5 секунд
+}
+}
+//Функция, срабатывающая при верном пароле/ключе:
+void allow()
+{
+64
+Serial.println("Access accept!"); //доступ получен
+digitalWrite(GREEN_LED, HIGH);
+digitalWrite(RED_LED, LOW);
+lcd.clear();
+lcd.setCursor(0,0);
+lcd.print(L"ДОСТУП РАЗРЕШЕН");
+summ="";
+presses = 0;
+delay(5000);
+digitalWrite(GREEN_LED, LOW);
+digitalWrite(RED_LED, HIGH);
+wait();
+}
+//Функция, срабатывающая при неправильном пароле/ключе:
+void denied()
+{
+Serial.println("Access denied!"); //доступ закрыт
+digitalWrite(RED_LED, HIGH);
+lcd.clear();
+lcd.setCursor(0,0);
+lcd.print(L"ДОСТУП ЗАПРЕЩЕН");
+summ="";
+presses = 0;
+delay(5000);
+wait();
+}
+//Функция режима ожидания:
+void wait()
+{
+lcd.clear();
+lcd.setCursor(4,0);
+lcd.print(L"ОЖИДАНИЕ");
+lcd.setCursor(4,1);
+lcd.print(L"ДЕЙСТВИЯ");
+}
